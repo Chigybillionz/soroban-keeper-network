@@ -1,230 +1,255 @@
-# Keeper Reputation Design & Epic Retrospective (E07)
+# Keeper Reputation and Claim Priority
 
-This is the architectural specification and epic retrospective for the keeper reputation system (Epic E07, issues 0318–0337). It establishes the on-chain scoring model, documents the outcome of the priority-queue feasibility study (issue 0322), details the security review of gaming vectors (issue 0336), records divergences from the initial design, and pins the stable contract surface for downstream consumers—most notably Epic E08 (Treasury) and Epic E09 (Governance).
+## Scope
 
----
+The registry stores a keeper's successful-task rate and missed-claim count.
+The score is informational: successful executions and expired lock windows
+update the record, and readers can inspect both the stored record and a
+read-time decayed score. This note evaluates whether that score can fairly
+prioritize `claim_task` on-chain.
 
-## 1. Context & Architectural Motivation
+## Recommendation
 
-In the initial protocol MVP (wave 1), the keeper registry treated all keepers identically: any address could claim any pending task on a first-come, first-served (FCFS) basis. The only accountability mechanism was the temporary claim lock (`lock_ledgers`), which permitted re-claiming if a keeper abandoned a task without executing it (issue 0016). The contract maintained no durable track record of keeper execution fidelity or reliability.
+Keep `claim_task` permissionless and first-come-first-served. Do not enforce
+reputation-weighted claim priority in the registry. Reputation can help task
+owners and keeper bots make decisions off-chain, but it cannot fairly reorder
+simultaneous claims under the contract's current execution model.
 
-While off-chain indexers (Epic E14) can reconstruct historical performance from raw ledger events, the on-chain registry lacked an internal metric to:
-1. Differentiate reliable keepers from malicious or flaky participants.
-2. Restrict claims on high-value or latency-sensitive tasks to proven performers (eligibility gating).
-3. Provide an on-chain trust signal for downstream economic and governance systems.
+## Why on-chain priority cannot resolve simultaneous claims
 
-Epic E07 introduces native on-chain reputation scoring into `keeper-registry`, balancing Soroban host execution constraints (CPU instruction limits, storage fees, absence of native cron timers) against economic security and gaming resistance.
+Soroban executes each transaction against the ledger's ordered transaction
+set. When a claim runs, the contract can read the current task and keeper
+reputation, but it cannot see claims that may be submitted later in the same
+ledger or determine that two transactions were submitted “around the same
+time.” The first transaction in ledger order changes the task from `Pending`
+to `Claimed`; the next one sees that state and is rejected. The contract has
+no control over that ordering and cannot identify which keeper asked first
+outside the order consensus applied.
 
----
+Adding a reputation comparison to `claim_task` therefore does not create a
+priority queue. It either leaves the first successful claim as the winner, or
+blocks that claimant and lets a later transaction try. Blocking a low-score
+keeper still gives the high-score keeper no guarantee of winning unless the
+contract waits for a defined claim window and collects competing claims
+before choosing a winner.
 
-## 2. Core Scoring Architecture (Issue 0318)
+A fair collection window would be a different protocol: keepers would need to
+register claim intents, the contract would need a later selection step, and
+the selection rule would need to account for duplicate identities, griefing,
+timeouts, and the cost of keeping task state open. A weighted lottery would
+still be probabilistic selection, rather than priority based on transaction
+arrival time. None of those rules are present in the current task lifecycle,
+and adding them would change the claim API and liveness guarantees.
 
-### 2.1 Tracked Actions
+## Off-chain use
 
-Reputation quantifies operational reliability through three primary signals:
+Keeper bots may use reputation as a courtesy signal, for example by waiting a
+configurable number of ledgers before attempting a task when their own score
+is low. This is voluntary self-selection only: the registry cannot verify a
+bot's wait, and a malicious or impatient keeper can claim immediately. It
+must not be described as an enforced fairness guarantee.
 
-1. **Successful Task Executions (`+1` score increment):** Credited inside `execute_task` when a claiming keeper successfully executes a task and passes any attached verifier.
-2. **Missed Lock Windows (`-penalty` score decrement):** Assessed when a keeper claims a task, locks it exclusively, and fails to submit a valid execution before `lock_ledgers` expires. This penalty is triggered lazily when another keeper re-claims the expired task via `claim_task` or when the task is expired/cancelled.
-3. **Slashing Interaction (Epic E06 Staking):** If staking and slashing are active, a contract-enforced slash represents a severe protocol violation (e.g., fraudulent proof submission) and applies a punitive reputation penalty or full score reset.
+Task owners and dashboards may also use reputation to decide which tasks to
+advertise to which bots. That affects off-chain discovery, not the
+permissionless `claim_task` rule.
 
-### 2.2 Storage Model & State Updates
+## Decision
 
-Soroban meters host storage read/write footprints directly into transaction fees. Two update strategies were evaluated:
-- **On-Demand Event History Replay:** Purely reproducible from events, but requires loading historical state or unbounded looping in contract code. This exceeds Soroban's CPU instruction ceiling ($O(N)$ gas) and was rejected.
-- **Incremental State Accumulation:** Storing an active `KeeperReputationRecord` in persistent storage (`DataKey::KeeperReputation(Address)`). State updates occur $O(1)$ inline during `execute_task` and re-claim transitions.
+On-chain reputation is useful as an auditable, informational record. The
+honest ceiling for this design is the record and its read-only views. The
+registry will not reject, delay, or reorder claims based on reputation.
+# Reputation Design (E07)
 
-**Decision:** Adopt incremental on-chain accumulation.
-- The record is created upon a keeper's first tracked action and updated as an inline side effect of core lifecycle operations.
-- The storage entry uses `Persistent` storage and inherits the registry's standard TTL renewal policy (`extend_ttl` to `INSTANCE_BUMP_LEDGERS`).
-- Read-only views (`keeper_reputation`) access this record side-effect-free without bumping TTL.
+This document pins the contract-level design for on-chain keeper reputation before implementation starts. It answers the core questions for E07, states explicit tradeoffs, and names any dependency on the staking work in E06.
 
-### 2.3 Reputation Decay Function (Issue 0321)
+## Status
 
-To ensure that stale historical performance does not grant eternal privileges and that past mistakes do not permanently incapacitate a rehabilitated keeper, reputation decays over time.
+This is a design doc, not an implementation plan. It defines the stable contract surface the first reputation build should satisfy and the explicit assumptions that future work can rely on.
 
-#### Design Analysis: Active vs. Lazy Decay
-- **Active Periodic Decay:** A scheduled cron job or maintenance transaction iterating over all registered keepers to decrement scores. Soroban does not support autonomous scheduled calls; requiring maintainers or third parties to pay transaction fees to decay inactive keepers is economically unviable and vulnerable to DoS.
-- **Lazy Read-Time Decay:** The contract stores the score alongside `last_update_ledger`. Whenever the score is queried or modified, the elapsed ledgers $(\Delta L = \text{current\_ledger} - \text{last\_update\_ledger})$ determine the decayed effective score:
+## 1. Context
 
-$$\text{Effective Score} = \text{Stored Score} \times \max\left(0, 1 - \frac{\Delta L}{\text{DECAY\_HORIZON}}\right)$$
+The current registry has no on-chain memory of a keeper's track record beyond the task state itself. A keeper can claim any claimable task, and the protocol treats each claim as independent. That makes task selection efficient but leaves the network without any durable signal for quality, reliability, or risk.
 
-**Decision:** Implement lazy, read-time deterministic decay. Any state mutation persists the newly decayed baseline, while read-only views compute the decayed score dynamically without writing to storage.
+This epic introduces a reputation system that the contract itself can read when deciding how to order or gate keeper participation.
 
----
+## 2. Design decisions
 
-## 3. Priority-Queue Feasibility Study (Issue 0322)
+### 2.1 What reputation tracks
 
-Issue 0322 investigated whether reputation could be used to implement an on-chain priority queue for task claims, giving higher-reputation keepers preferential access to pending tasks.
+The first reputation model tracks the following signals:
 
-### 3.1 The Soroban Execution Constraint
+- successful executions;
+- missed lock windows / abandoned claims that expire into re-claimable status;
+- slash events, if E06 staking lands;
+- optionally, explicit failures that are objectively attributable to the keeper (for example, a proof rejection if the project later adds verifier-aware task execution).
 
-In Soroban, transactions within a ledger are executed in an order determined by the consensus protocol and network-level transaction scheduling. The smart contract has no visibility into:
-- The sub-ledger arrival order of transactions.
-- Off-chain mempool competition.
-- "Nearly simultaneous" claim submissions.
+The score is intentionally not a generic “social trust” score. It is a narrow, auditable ledger of keeper reliability in the task lifecycle.
 
-`claim_task` operates under a first-come, first-served (FCFS) model: whichever valid transaction is committed first within the ledger claims the task.
+#### Rationale
 
-### 3.2 Evaluated On-Chain Priority Mechanisms
+This keeps the signal anchored to contract-observable events rather than subjective metadata. A task lifecycle already has concrete, on-chain facts:
 
-Three on-chain priority models were studied:
+- was a task executed successfully?
+- did the keeper claim and then let the lock expire without a valid completion?
+- was the keeper slashed for violating the staking rules?
 
-1. **Reputation-Tiered Claim Windows (Time Delays):**
-   - *Mechanism:* Keepers below a reputation threshold must wait $K$ ledgers after task registration before their `claim_task` call is accepted; top-tier keepers can claim immediately.
-   - *Finding:* Creates unnecessary latency for task creators, complicates task deadline calculations, and stalls urgent tasks if high-reputation keepers are temporarily offline.
-2. **Two-Phase Commit / Claim Auction:**
-   - *Mechanism:* Keepers submit claim intents during a commitment window; at window close, the contract assigns the claim lock to the highest-reputation bidder.
-   - *Finding:* Drastically increases latency, multiplies transaction fees (two transactions per claim), creates state bloat, and introduces griefing vectors where keepers submit intents without executing.
-3. **Dynamic Lock Lengths:**
-   - *Mechanism:* High-reputation keepers receive longer lock windows; low-reputation keepers receive shorter windows.
-   - *Finding:* Does not influence claim contention—it only alters lock duration after a claim has already succeeded.
+Each of these is measurable from state transitions and the event log, which makes the score reproducible and auditable.
 
-### 3.3 Feasibility Outcome & Recommendation
+### 2.2 Scoring model
 
-**Outcome: EXPLICITLY DECLINED FOR ON-CHAIN ENFORCEMENT.**
+The base score is a signed integer accumulator, represented as a per-keeper record in contract storage:
 
-Enforcing an on-chain priority queue on Soroban is technically ill-suited to the host execution model and introduces adverse economic friction. 
+- `Reputation(Address) -> i128`
 
-**Recommendation:**
-- Keep on-chain claiming permissionless and FCFS.
-- Protect task execution through an **Eligibility Floor** (§4).
-- Offload priority behavior to **off-chain keeper bot coordination** (issue 0330): keeper bots can query `keeper_reputation` and voluntarily implement backoff delays or yield claims based on internal operator policies, but the contract does not enforce this on-chain.
+The score is intentionally sparse and monotonic in the sense that every observed event updates it by a bounded delta rather than by recalculating from the whole historical event stream.
 
----
+Suggested default:
 
-## 4. Claim Eligibility Floor (Issue 0323)
+- successful execution: +1
+- missed lock / claim abandonment: -1
+- slash: -N, where `N` is a configurable slash severity or a fixed governance-approved penalty in the first version
 
-In place of an on-chain priority queue, issue 0323 introduces an **Optional Claim Eligibility Floor**:
+The design chooses incremental updates over on-demand recomputation for the first implementation because:
 
-- **Mechanism:** An administrative configuration parameter, `min_reputation: u32`. When enabled $(\text{min\_reputation} > 0)$, `claim_task` checks the decayed reputation of the caller:
-  $$\text{Effective Reputation}(\text{caller}) \ge \text{min\_reputation}$$
-  If the check fails, the transaction aborts with `KeeperError::ReputationTooLow`.
-- **Default State:** Defaults to `0` (disabled). This ensures full backward compatibility: existing keepers are never retroactively locked out upon contract upgrades.
-- **Administrative Control:** Settable solely by `Admin` (or subsequent governance timelock in E09) via `set_min_reputation(min_reputation: u32)`.
-
----
-
-## 5. Security Review & Gaming Vectors (Issue 0336)
-
-Issue 0336 conducted a comprehensive adversarial review of the reputation mechanism. Three primary vectors were evaluated:
-
-### 5.1 Gaming Vector 1: Self-Dealing via Trivial Wash Tasks
-- **Threat:** A keeper creates trivial, low-reward tasks that it funds itself, immediately claims, and executes with a dummy verifier/proof to artificially inflate its reputation score.
-- **Analysis:** In a permissionless smart contract without identity or KYC, the contract cannot distinguish between a legitimate third-party dApp task and a self-funded wash task.
-- **Mitigation & Accepted Risk:**
-  - Protocol fees (configured via `fee_bps`) and minimum task rewards (`min_reward`) impose an explicit economic cost per reputation point farmed.
-  - **Resolution: ACCEPTED PROTOCOL LIMITATION.** The cost-of-attack is proportional to capital expended in protocol fees. Because reputation can be economically farmed, **reputation must NEVER be used as a standalone, unweighted basis for monetary distribution or plutocratic governance voting power.**
-
-### 5.2 Gaming Vector 2: Decay Boundary Manipulation
-- **Threat:** Keepers exploit discrete decay calculation intervals by batching claims immediately before an epoch rollover to prevent score degradation.
-- **Analysis:** Discrete intervals (e.g., weekly epochs) incentivize artificial transaction clustering near boundary ledgers.
-- **Mitigation:** The decay function is calculated continuously per-ledger $(\Delta L)$, eliminating discrete cliff boundaries and preventing boundary timing exploits.
-
-### 5.3 Gaming Vector 3: Eligibility Floor Risk Aversion ("Chilling Effect")
-- **Threat:** If missed locks incur severe penalties, keepers may refuse to claim difficult, variable-latency, or verifier-attached tasks, fearing that a single network delay or verifier edge-case will drop them below `min_reputation` and exclude them from all future tasks.
-- **Mitigation:**
-  - Asymmetric penalty ratio: Missed locks penalize score moderately rather than wiping out accumulated history.
-  - Recovery path: If a keeper falls below the floor, the admin/governance can allow special "open" tasks (or lower tiers) so the keeper can rebuild standing, or the floor can be maintained at a modest baseline.
-
----
-
-## 6. Summary of Architectural Decisions
-
-| Aspect | Original Proposal (0318) | Shipped Design / Final Outcome | Rationale / Justification |
-|---|---|---|---|
-| **Claim Priority** | On-chain reputation-weighted priority queue | **Explicitly Declined.** Replaced by Eligibility Floor (`min_reputation`) and off-chain bot self-selection | Soroban transaction ordering and block inclusion do not permit fair, low-latency, on-chain claim arbitration without prohibitive gas and state contention. |
-| **Decay Calculation** | Scheduled or periodic decay | **Lazy Read-Time Calculation** based on elapsed ledgers $(\Delta L)$ | Avoids unbounded state iteration and external subsidization of maintenance transactions. |
-| **Storage Model** | Historical event replay vs. storage record | **Incremental Persistent Storage** (`KeeperReputation(Address)`) | $O(1)$ execution cost within transaction CPU budget limits; offloads full history to indexer (E14). |
-| **Gating Mechanism** | Strict gating on all tasks | **Optional Admin-Configured Floor** (`min_reputation`), defaulting to `0` | Preserves permissionless access by default; prevents retroactive lockout of existing keepers. |
-| **E06 Staking Coupling** | Hard dependency on staking slashes | **Decoupled Architecture with Optional Hook** | Allows reputation to ship and operate independently even if staking (E06) is deferred, unbonded, or absent. |
-
----
-
-## 7. Epic E07 Retrospective: Shipped vs Studied and Deferred
-
-### 7.1 Shipped Deliverables
-
-1. **Storage & Tracking Logic (`contracts/keeper-registry/src/reputation.rs`):**
-   - Core data structure `KeeperReputationRecord` tracking successes, missed locks, last update ledger, and base score.
-   - Integrated hooks into `execute_task` (success increment) and `claim_task` (missed lock penalty on re-claim).
-2. **Read-Only Inspection View (`contracts/keeper-registry/src/views.rs`):**
-   - `keeper_reputation(env: Env, keeper: Address) -> KeeperReputationRecord`: Read-only, side-effect-free, dynamic lazy decay calculation, never bumps TTL.
-3. **Configurable Eligibility Floor (`contracts/keeper-registry/src/task.rs`):**
-   - `min_reputation` enforcement during `claim_task`.
-   - Admin configuration entry point `set_min_reputation(env: Env, min_reputation: u32)`.
-   - New typed error `KeeperError::ReputationTooLow`.
-4. **Reputation Lifecycle Events (`contracts/keeper-registry/src/events.rs`):**
-   - Standardized topic `("reputation", "update")` emitting `(keeper: Address, action: Symbol, new_score: u32)`.
-5. **Testing & Invariant Coverage:**
-   - Unit tests covering scoring arithmetic, boundary ledger decay, and floor rejection.
-   - Property tests confirming consistency between stored incremental records and raw event replay.
-
-### 7.2 Studied and Deferred Items
-
-- **On-Chain Priority Queue (Issue 0322):** Formally declined on-chain due to Soroban host execution constraints; delegated to off-chain keeper bot task selection (issue 0330).
-- **Automated Slasher Integration (Issue 0326):** Deferred pending final deployment and stabilization of Epic E06 staking contracts. The storage layout and scoring functions provide the interface hook (`slash_penalty`), but the live invocation hook remains dormant until E06 settles on mainnet.
-
----
-
-## 8. Stable Surface for Downstream Consumers
-
-Downstream contracts, SDKs, indexers, and governance protocols must integrate against the following stable on-chain surface:
-
-### 8.1 Contract Types & Storage Layout
-
-```rust
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KeeperReputationRecord {
-    /// Total successful task executions completed by the keeper.
-    pub successful_executions: u32,
-    /// Total claimed tasks that expired without execution before re-claim.
-    pub missed_locks: u32,
-    /// Ledger sequence number at which the record was last mutated.
-    pub last_update_ledger: u32,
-    /// Normalized reputation score (prior to read-time decay calculation).
-    pub base_score: u32,
-    /// Decayed effective score at current ledger height.
-    pub effective_score: u32,
-}
-```
-
-**Storage Key:**
-```rust
-DataKey::KeeperReputation(Address) // Persistent storage scope
-DataKey::MinReputation            // Instance storage scope
-```
-
-### 8.2 Public View & Entry Point Signatures
-
-```rust
-pub trait IKeeperReputation {
-    /// Returns the complete reputation record for `keeper`, including decayed score.
-    /// Returns default zero-initialized record if `keeper` has no history.
-    /// Side-effect-free, simulation-safe, does not bump TTL.
-    fn keeper_reputation(env: Env, keeper: Address) -> KeeperReputationRecord;
-
-    /// Returns the active claim eligibility floor. Returns 0 if disabled.
-    fn min_reputation(env: Env) -> u32;
-
-    /// Configures the claim eligibility floor. Restricted to Admin/Governance.
-    fn set_min_reputation(env: Env, min_reputation: u32);
-}
-```
-
-### 8.3 Invariants Guarantees
-
-- **I-REP-1 (Monotonic Decay):** Between state-mutating updates, a keeper's `effective_score` is monotonically non-increasing over advancing ledger sequences.
-- **I-REP-2 (Read Purity):** Calling `keeper_reputation` never modifies instance or persistent storage and never modifies TTL.
-- **I-REP-3 (Zero-Floor Default):** When `min_reputation == 0`, `claim_task` imposes zero reputation checks, ensuring 100% backward compatibility with wave 1-3 tasks.
-
-### 8.4 Guidance for Epic E08 (Treasury & Fee Distribution)
-- The Treasury contract may query `keeper_reputation` as an advisory filter for bonus distributions or fee rebates.
-- Keepers with `effective_score == 0` or high `missed_locks` ratios should be excluded from performance dividend pools.
-
-### 8.5 Guidance for Epic E09 (Governance & Voting Power)
-- **CRITICAL SECURITY DIRECTIVE:** As established in §5.1, on-chain reputation is susceptible to economic self-dealing (wash tasks). Therefore:
-  - **Reputation MUST NOT directly grant 1:1 governance voting power or token minting rights.**
-  - If Epic E09 incorporates reputation into voting weights, it should do so only as a **capped sub-linear modifier** (e.g., square-root or quadratic participation multiplier) applied to staked KPRS governance tokens:
-    $$\text{Voting Power} = \text{Staked Tokens} \times \left(1 + \min\left(\alpha, \beta \sqrt{\text{effective\_score}}\right)\right)$$
-  - Pure reputation voting is explicitly prohibited to prevent sybil/plutocratic capture.
+- it is cheap to read during claim ordering or eligibility checks;
+- it matches the contract's general pattern of storing compact aggregate state rather than recomputing from a full history;
+- it is simpler to keep within Soroban storage and TTL constraints;
+- it gives off-chain consumers a single, stable view of current reputation without forcing a full replay.
+
+#### Rationale against full-history recomputation
+
+A full-history model would require either:
+
+- storing the entire raw event stream in a queryable form, or
+- re-reading every historical action on each score lookup.
+
+That is operationally costly, harder to keep bounded, and couples a simple on-chain primitive to an expensive read pattern. The contract should keep reputation as a compact state record, with events remaining the canonical audit trail.
+
+### 2.3 Decay
+
+The first version uses a bounded, simple decay policy:
+
+- reputation decays over time but does not reset to zero;
+- decay is applied as a weighted reduction over a configured window;
+- the exact function should be linear or piecewise-linear rather than a complex nonlinear model in the first implementation.
+
+A practical first design is:
+
+- keep an `updated_at` timestamp or ledger for each keeper;
+- compute a decay factor using the elapsed time since the last update;
+- multiply the cumulative score by a base factor that is less than 1 over a configured period.
+
+For example:
+
+- score decays by a small percentage per month or per N ledgers;
+- very old failures matter less than recent ones.
+
+This prevents a single ancient failure from permanently defining a keeper's trustworthiness and makes the score responsive to current behavior.
+
+#### Rationale
+
+Without decay, reputation becomes a permanent historical ledger that penalizes a keeper forever, even after long periods of reliable service. That is too rigid for a network where keepers may go offline, temporarily fail, or re-enter after a long absence.
+
+### 2.4 What reputation gates or influences
+
+This epic does not gate core task execution with a hard reputation ban in the first version.
+
+The first available decisions are:
+
+1. informational read-only view only;
+2. claim ordering priority queue; or
+3. minimum eligibility score.
+
+The design chooses a conservative option: a read-only view and a configurable claim-priority or eligibility hook, but no hard ban by default.
+
+#### Preferred initial surface
+
+- `reputation(keeper) -> i128` read-only view
+- `set_reputation_floor` admin-configurable eligibility threshold, if the project wants a floor
+- optional `claim_task` check against a configured floor only if the project explicitly decides to gate by score
+
+This design keeps the reputation primitive usable without forcing an immediate network-wide policy decision about claim access.
+
+### 2.5 Dependency on epic E06 staking
+
+The design is intentionally explicit about the dependency:
+
+- reputation is useful even without staking;
+- if E06 lands, slash events become a first-class negative signal in the score;
+- if the score affects slash severity, that is a future design decision and should be treated as a downstream dependency, not assumed in the core score model.
+
+The key rule is: do not tie reputation to slash semantics unless E06 is already part of the executed surface. If E06 has not landed, the score can still be stored and read; it simply does not include slash-based adjustments yet.
+
+## 3. Storage model
+
+The following storage keys are the proposed stable surface prior to implementation.
+
+| Key | Type | Storage | TTL | Default when unset |
+|-----|------|---------|-----|---------------------|
+| `Reputation(Address)` | `i128` | Persistent | ~1 year (tunable) | `0` |
+| `ReputationUpdatedAt(Address)` | `u64` | Persistent | ~1 year (tunable) | `0` |
+| `ReputationDecayRate` | `u128` or `u64` | Instance | Instance lifetime | configured default |
+| `ReputationFloor` | `i128` | Instance | Instance lifetime | `0` |
+| `ReputationEnabled` | `bool` | Instance | Instance lifetime | `false` |
+
+This separates the current score from its last update time and makes the decay function deterministic. It also keeps the configuration keys at instance scope to avoid duplicating per-keeper metadata in the hot path.
+
+## 4. Stable entry points and views
+
+The first design should pin the following signatures before implementation begins.
+
+### 4.1 Admin-configurable hooks
+
+- `set_reputation_decay_rate(rate)`
+- `set_reputation_floor(floor)`
+- `set_reputation_enabled(enabled)`
+
+These are admin-controlled because they change the network's quality gate or scoring policy. The exact values should be small, conservative, and auditable.
+
+### 4.2 Keeper-facing views
+
+- `reputation(keeper: Address) -> i128`
+- `reputation_ready_for_claim(keeper: Address) -> bool` (optional; only if a floor is enforced)
+
+### 4.3 Internal update path
+
+The contract should have internal helpers such as:
+
+- `record_success(keeper)`
+- `record_missed_claim(keeper)`
+- `record_slash(keeper, amount)`
+
+Those helpers are not public ABI surface; they are the internal transition functions that the task lifecycle and staking logic call when relevant events occur.
+
+## 5. Why this design is the right first step
+
+This is a deliberately small and auditable model:
+
+- it uses contract-observable actions as inputs;
+- it stores compact aggregate state instead of entire history;
+- it allows a future claim-priority or eligibility policy without overcommitting to one immediately;
+- it leaves slashing and dispute semantics to E06, which keeps the dependency explicit and safe.
+
+The key design principle is: reputation should be a durable, on-chain signal, not a speculative one-off heuristic.
+
+## 6. Explicit non-goals
+
+This doc does not define:
+
+- full social scoring or identity reputation;
+- subjective off-chain trust ratings;
+- a reputation-weighted vote or governance power model;
+- automatic slash severity scaling based on reputation.
+
+Those are future epics and must be added only once the base reputation primitive is stabilized.
+
+## 7. Implementation boundary
+
+The implementation should not begin until the following are fixed in the design review:
+
+- the exact scoring deltas and their sign conventions;
+- whether claim ordering or eligibility gates are enabled in the first release;
+- the decay rate and precise time basis (ledger-based or timestamp-based);
+- whether slash events are included immediately or gated behind E06's completion.
+
+This keeps the contract surface stable and prevents a reputation system from being built against a moving target.
